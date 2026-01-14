@@ -13,7 +13,8 @@ Corrupted JPGs are skipped and logged during file listing/verification.
 
 ## Native setup
 
-- Install Python deps: `python3 -m pip install -r requirements.txt`
+- Install Python deps (uv): `uv venv && source .venv/bin/activate && uv pip install -r requirements.txt`
+- (Fallback) pip: `python3 -m pip install -r requirements.txt`
 - Install a platform-appropriate `torch` + `torchvision` separately.
 
 ## Train
