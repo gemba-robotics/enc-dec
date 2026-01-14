@@ -1,0 +1,10 @@
+# Note: On Jetson/Docker, install PyTorch/torchvision via the base image (JetPack-matched).
+# For native execution, install torch/torchvision separately for your platform.
+numpy
+pandas
+Pillow
+PyYAML
+tqdm
+matplotlib
+scikit-learn
+

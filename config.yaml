@@ -1,0 +1,49 @@
+data:
+  root: /path/to/dataset
+  train_dir: train
+  val_dir: val
+  test_good_dir: test_good
+  test_bad_dir: test_bad
+  extensions: [".jpg", ".jpeg", ".JPG", ".JPEG"]
+  verify_images: true
+
+preprocess:
+  img_size: 256
+  resize_policy: direct # direct only (policy B)
+  augment:
+    enabled: false
+    rotation_deg: 5
+    translate_frac: 0.02
+    brightness: 0.05
+    contrast: 0.05
+
+model:
+  base_channels: 32
+  num_downsamples: 4
+  latent_dim: 128
+
+training:
+  epochs: 50
+  batch_size: 16
+  num_workers: 2
+  lr: 0.001
+  loss_type: mse # mse | smoothl1
+  amp: false
+  seed: 42
+  deterministic: true
+  save_recon_every_n_epochs: 5
+  lr_scheduler:
+    type: none # none | cosine | step
+    cosine_tmax: 50
+    step_size: 20
+    gamma: 0.5
+
+threshold:
+  method: percentile # percentile | mean_std
+  percentile: 99
+  mean_std_k: 3.0
+
+runtime:
+  device: auto # auto | cpu | cuda
+  runs_dir: runs
+
