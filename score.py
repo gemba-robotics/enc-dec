@@ -14,9 +14,11 @@ from tqdm import tqdm
 from encdec.data import (
     AugmentConfig,
     GrayscaleImageDataset,
+    GrayscalePoseDataset,
     build_transform,
     filter_corrupted,
     list_images,
+    list_images_by_pose,
     split_test_paths,
     try_decode_grayscale,
 )
@@ -31,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=str, required=True)
 
     group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--data_root", type=str, help="Dataset root containing test_good/ and optionally test_bad/.")
+    group.add_argument("--data_root", type=str, help="Dataset root (classic) or poses root (poses layout).")
     group.add_argument("--input_dir", type=str, help="Folder of images to score (labels omitted).")
     group.add_argument("--manifest_csv", type=str, help="CSV with a 'path' column and optional 'label' column.")
     p.add_argument("--manifest_base_dir", type=str, default=None, help="Prepended to manifest paths if provided.")
@@ -60,6 +62,7 @@ def main() -> None:
     ckpt_path = Path(args.checkpoint)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt["config"]
+    data_layout = str(cfg["data"].get("layout", "classic"))
 
     device_str = args.device if args.device is not None else cfg["runtime"]["device"]
     device = pick_device(device_str)
@@ -82,15 +85,25 @@ def main() -> None:
     extensions = cfg["data"]["extensions"]
     verify_images = bool(cfg["data"].get("verify_images", True))
 
+    pose_ids = None
     if args.data_root:
-        paths, labels = split_test_paths(
-            data_root=args.data_root,
-            test_good_dir=cfg["data"]["test_good_dir"],
-            test_bad_dir=cfg["data"]["test_bad_dir"],
-            extensions=extensions,
-            verify_images=verify_images,
-            corrupt_log_path=Path(args.output_csv).with_suffix(".corrupt.txt"),
-        )
+        if data_layout == "poses":
+            paths, pose_ids = list_images_by_pose(
+                poses_root=args.data_root,
+                extensions=extensions,
+                verify_images=verify_images,
+                corrupt_log_path=Path(args.output_csv).with_suffix(".corrupt.txt"),
+            )
+            labels = None
+        else:
+            paths, labels = split_test_paths(
+                data_root=args.data_root,
+                test_good_dir=cfg["data"]["test_good_dir"],
+                test_bad_dir=cfg["data"]["test_bad_dir"],
+                extensions=extensions,
+                verify_images=verify_images,
+                corrupt_log_path=Path(args.output_csv).with_suffix(".corrupt.txt"),
+            )
     elif args.input_dir:
         paths = list_images(args.input_dir, extensions)
         if verify_images:
@@ -104,18 +117,26 @@ def main() -> None:
         raw_paths = [Path(p) for p in manifest["path"].astype(str).tolist()]
         paths = [base / p if base is not None and not p.is_absolute() else p for p in raw_paths]
         labels = manifest["label"].tolist() if "label" in manifest.columns else None
+        if "pose_id" in manifest.columns:
+            pose_ids = manifest["pose_id"].astype(str).tolist()
         if verify_images:
             before = list(paths)
             paths = filter_corrupted(paths, Path(args.output_csv).with_suffix(".corrupt.txt"))
             if labels is not None:
                 kept = {str(p) for p in paths}
                 labels = [y for p, y in zip(before, labels) if str(p) in kept]
+            if pose_ids is not None:
+                kept = {str(p) for p in paths}
+                pose_ids = [pid for p, pid in zip(before, pose_ids) if str(p) in kept]
 
     if len(paths) == 0:
         raise RuntimeError("No images found to score.")
 
     tf = build_transform(img_size=img_size, train=False, augment=AugmentConfig(enabled=False))
-    ds = GrayscaleImageDataset(paths, transform=tf, labels=labels)
+    if pose_ids is not None:
+        ds = GrayscalePoseDataset(paths, pose_ids, transform=tf, labels=labels)
+    else:
+        ds = GrayscaleImageDataset(paths, transform=tf, labels=labels)
 
     batch_size = int(args.batch_size) if args.batch_size is not None else int(cfg["training"]["batch_size"])
     num_workers = int(args.num_workers) if args.num_workers is not None else int(cfg["training"]["num_workers"])
@@ -133,41 +154,72 @@ def main() -> None:
     rows = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="scoring"):
-            if labels is None:
-                x, paths_b = batch
-                labels_b = None
+            if pose_ids is None:
+                if labels is None:
+                    x, paths_b = batch
+                    pose_b = None
+                    labels_b = None
+                else:
+                    x, paths_b, labels_b = batch
+                    pose_b = None
             else:
-                x, paths_b, labels_b = batch
+                if labels is None:
+                    x, paths_b, pose_b = batch
+                    labels_b = None
+                else:
+                    x, paths_b, pose_b, labels_b = batch
 
             x = x.to(device, non_blocking=True)
             recon = model(x)
             scores = anomaly_score_mse(x, recon).detach().cpu().numpy()
 
             if labels_b is None:
-                for p, s in zip(paths_b, scores):
-                    rows.append({"path": p, "label": None, "score": float(s)})
+                for i, (p, s) in enumerate(zip(paths_b, scores)):
+                    row = {"path": p, "label": None, "score": float(s)}
+                    if pose_b is not None:
+                        row["pose_id"] = str(pose_b[i])
+                    rows.append(row)
             else:
-                for p, y, s in zip(paths_b, labels_b, scores):
-                    rows.append({"path": p, "label": int(y), "score": float(s)})
+                for i, (p, y, s) in enumerate(zip(paths_b, labels_b, scores)):
+                    row = {"path": p, "label": int(y), "score": float(s)}
+                    if pose_b is not None:
+                        row["pose_id"] = str(pose_b[i])
+                    rows.append(row)
 
     df = pd.DataFrame(rows)
     df.to_csv(args.output_csv, index=False)
 
-    threshold = None
+    threshold: float | None = None
+    thresholds_by_pose: dict[str, float] | None = None
     if args.threshold is not None:
         threshold = float(args.threshold)
     elif args.threshold_file is not None:
         with open(args.threshold_file, "r", encoding="utf-8") as f:
-            threshold = float(json.load(f)["threshold"])
+            data = json.load(f)
+            if "pose_thresholds" in data:
+                thresholds_by_pose = {k: float(v["threshold"]) for k, v in data["pose_thresholds"].items()}
+            else:
+                threshold = float(data["threshold"])
     else:
         run_dir = ckpt_path.parent.parent  # runs/<timestamp> when checkpoint is in runs/<timestamp>/checkpoints/
-        cand = run_dir / "threshold.json"
-        if cand.exists():
-            with open(cand, "r", encoding="utf-8") as f:
+        cand_pose = run_dir / "thresholds_by_pose.json"
+        cand_global = run_dir / "threshold.json"
+        if cand_pose.exists():
+            with open(cand_pose, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                thresholds_by_pose = {k: float(v["threshold"]) for k, v in data["pose_thresholds"].items()}
+        elif cand_global.exists():
+            with open(cand_global, "r", encoding="utf-8") as f:
                 threshold = float(json.load(f)["threshold"])
 
-    if threshold is not None:
-        df["predicted_bad"] = (df["score"] > threshold).astype(int)
+    if thresholds_by_pose is not None:
+        if "pose_id" not in df.columns:
+            raise ValueError("Per-pose thresholds provided but CSV has no pose_id column.")
+        df["pose_threshold"] = df["pose_id"].map(thresholds_by_pose).astype(float)
+        df["predicted_bad"] = (df["score"] > df["pose_threshold"]).astype(int)
+        df.to_csv(args.output_csv, index=False)
+    elif threshold is not None:
+        df["predicted_bad"] = (df["score"] > float(threshold)).astype(int)
         df.to_csv(args.output_csv, index=False)
 
     if args.save_qualitative and labels is not None:

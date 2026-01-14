@@ -78,6 +78,91 @@ def filter_corrupted(
     return valid
 
 
+def list_pose_dirs(poses_root: str | Path) -> list[Path]:
+    poses_root = Path(poses_root)
+    if not poses_root.exists():
+        return []
+    return sorted([p for p in poses_root.iterdir() if p.is_dir()])
+
+
+def list_images_by_pose(
+    poses_root: str | Path,
+    extensions: Sequence[str],
+    verify_images: bool,
+    corrupt_log_path: str | Path | None,
+) -> tuple[list[Path], list[str]]:
+    """
+    Returns parallel lists (paths, pose_ids).
+    Pose id is the immediate folder name under poses_root.
+    """
+    pose_dirs = list_pose_dirs(poses_root)
+    all_paths: list[Path] = []
+    all_pose_ids: list[str] = []
+    corrupted: list[str] = []
+
+    for pose_dir in pose_dirs:
+        pose_id = pose_dir.name
+        paths = list_images(pose_dir, extensions)
+        if verify_images:
+            for p in paths:
+                if try_decode_grayscale(p) is None:
+                    corrupted.append(f"{pose_id}\t{p}")
+                else:
+                    all_paths.append(p)
+                    all_pose_ids.append(pose_id)
+        else:
+            all_paths.extend(paths)
+            all_pose_ids.extend([pose_id] * len(paths))
+
+    if corrupt_log_path is not None and corrupted:
+        corrupt_log_path = Path(corrupt_log_path)
+        corrupt_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(corrupt_log_path, "w", encoding="utf-8") as f:
+            for item in corrupted:
+                f.write(item + "\n")
+
+    return all_paths, all_pose_ids
+
+
+def split_train_val_by_pose(
+    paths: Sequence[Path],
+    pose_ids: Sequence[str],
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[Path], list[str], list[Path], list[str]]:
+    if len(paths) != len(pose_ids):
+        raise ValueError("paths and pose_ids must have the same length")
+    if not (0.0 < val_fraction < 1.0):
+        raise ValueError("val_fraction must be in (0,1)")
+
+    rng = np.random.RandomState(seed)
+    by_pose: dict[str, list[int]] = {}
+    for i, pid in enumerate(pose_ids):
+        by_pose.setdefault(pid, []).append(i)
+
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    for pid, idxs in by_pose.items():
+        idxs = list(idxs)
+        rng.shuffle(idxs)
+        if len(idxs) == 1:
+            val_idx.extend(idxs)
+            continue
+        n_val = int(round(len(idxs) * val_fraction))
+        n_val = max(1, min(n_val, len(idxs) - 1))
+        val_idx.extend(idxs[:n_val])
+        train_idx.extend(idxs[n_val:])
+
+    train_idx = sorted(train_idx)
+    val_idx = sorted(val_idx)
+
+    train_paths = [paths[i] for i in train_idx]
+    train_pose_ids = [pose_ids[i] for i in train_idx]
+    val_paths = [paths[i] for i in val_idx]
+    val_pose_ids = [pose_ids[i] for i in val_idx]
+    return train_paths, train_pose_ids, val_paths, val_pose_ids
+
+
 def build_transform(
     img_size: int,
     train: bool,
@@ -154,6 +239,39 @@ class GrayscaleImageDataset(Dataset):
         if self.labels is None:
             return tensor, path_str
         return tensor, path_str, int(self.labels[idx])
+
+
+class GrayscalePoseDataset(Dataset):
+    def __init__(
+        self,
+        paths: Sequence[Path],
+        pose_ids: Sequence[str],
+        transform: Callable[[Image.Image], torch.Tensor],
+        labels: Sequence[int] | None = None,
+    ) -> None:
+        if len(paths) != len(pose_ids):
+            raise ValueError("pose_ids must be same length as paths")
+        if labels is not None and len(labels) != len(paths):
+            raise ValueError("labels must be same length as paths")
+        self.paths = list(paths)
+        self.pose_ids = list(pose_ids)
+        self.labels = list(labels) if labels is not None else None
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        path = self.paths[idx]
+        img = try_decode_grayscale(path)
+        if img is None:
+            raise RuntimeError(f"Failed to decode image (should have been filtered): {path}")
+        tensor = self.transform(img)
+        path_str = str(path)
+        pose_id = str(self.pose_ids[idx])
+        if self.labels is None:
+            return tensor, path_str, pose_id
+        return tensor, path_str, pose_id, int(self.labels[idx])
 
 
 def split_test_paths(

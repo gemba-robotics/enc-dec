@@ -1,5 +1,6 @@
 data:
   root: /path/to/dataset
+  layout: classic # classic | poses
   train_dir: train
   val_dir: val
   test_good_dir: test_good
@@ -31,6 +32,7 @@ training:
   amp: false
   seed: 42
   deterministic: true
+  val_fraction: 0.1 # used when data.layout=poses
   save_recon_every_n_epochs: 5
   lr_scheduler:
     type: none # none | cosine | step
@@ -46,4 +48,3 @@ threshold:
 runtime:
   device: auto # auto | cpu | cuda
   runs_dir: runs
-

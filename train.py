@@ -11,7 +11,17 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from encdec.config_utils import deep_update, load_yaml, save_yaml
-from encdec.data import AugmentConfig, GrayscaleImageDataset, filter_corrupted, list_images, save_json, build_transform
+from encdec.data import (
+    AugmentConfig,
+    GrayscaleImageDataset,
+    GrayscalePoseDataset,
+    build_transform,
+    filter_corrupted,
+    list_images,
+    list_images_by_pose,
+    save_json,
+    split_train_val_by_pose,
+)
 from encdec.model import ConvAutoencoder, ModelConfig
 from encdec.runtime import make_run_dir, make_worker_init_fn, pick_device, save_checkpoint, seed_everything
 from encdec.scoring import anomaly_score_mse, build_loss
@@ -24,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="config.yaml")
 
     p.add_argument("--data_root", type=str, default=None)
+    p.add_argument("--layout", type=str, default=None, choices=["classic", "poses"])
+    p.add_argument("--val_fraction", type=float, default=None, help="Used when layout=poses (split within pose).")
     p.add_argument("--img_size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
@@ -46,6 +58,10 @@ def main() -> None:
     overrides = {}
     if args.data_root is not None:
         overrides = deep_update(overrides, {"data": {"root": args.data_root}})
+    if args.layout is not None:
+        overrides = deep_update(overrides, {"data": {"layout": args.layout}})
+    if args.val_fraction is not None:
+        overrides = deep_update(overrides, {"training": {"val_fraction": float(args.val_fraction)}})
     if args.img_size is not None:
         overrides = deep_update(overrides, {"preprocess": {"img_size": int(args.img_size)}})
     if args.epochs is not None:
@@ -74,6 +90,7 @@ def main() -> None:
     cfg = deep_update(cfg, overrides)
 
     data_root = Path(cfg["data"]["root"])
+    data_layout = str(cfg["data"].get("layout", "classic"))
     train_dir = cfg["data"]["train_dir"]
     val_dir = cfg["data"]["val_dir"]
     extensions = cfg["data"]["extensions"]
@@ -100,23 +117,50 @@ def main() -> None:
     device = pick_device(cfg["runtime"]["device"])
     print(f"Device: {device}")
 
-    train_paths = list_images(data_root / train_dir, extensions)
-    val_paths = list_images(data_root / val_dir, extensions)
+    train_pose_ids: list[str] | None = None
+    val_pose_ids: list[str] | None = None
 
-    if verify_images:
-        train_paths = filter_corrupted(train_paths, run_dir / "logs" / "corrupt_train.txt")
-        val_paths = filter_corrupted(val_paths, run_dir / "logs" / "corrupt_val.txt")
+    if data_layout == "classic":
+        train_paths = list_images(data_root / train_dir, extensions)
+        val_paths = list_images(data_root / val_dir, extensions)
 
-    if len(train_paths) == 0:
-        raise RuntimeError(f"No training images found under: {data_root / train_dir}")
-    if len(val_paths) == 0:
-        raise RuntimeError(f"No validation images found under: {data_root / val_dir}")
+        if verify_images:
+            train_paths = filter_corrupted(train_paths, run_dir / "logs" / "corrupt_train.txt")
+            val_paths = filter_corrupted(val_paths, run_dir / "logs" / "corrupt_val.txt")
+
+        if len(train_paths) == 0:
+            raise RuntimeError(f"No training images found under: {data_root / train_dir}")
+        if len(val_paths) == 0:
+            raise RuntimeError(f"No validation images found under: {data_root / val_dir}")
+    elif data_layout == "poses":
+        all_paths, all_pose_ids = list_images_by_pose(
+            poses_root=data_root,
+            extensions=extensions,
+            verify_images=verify_images,
+            corrupt_log_path=run_dir / "logs" / "corrupt_poses.txt",
+        )
+        if len(all_paths) == 0:
+            raise RuntimeError(f"No pose images found under: {data_root}")
+
+        val_fraction = float(cfg["training"].get("val_fraction", 0.1))
+        train_paths, train_pose_ids, val_paths, val_pose_ids = split_train_val_by_pose(
+            all_paths, all_pose_ids, val_fraction=val_fraction, seed=seed
+        )
+        if len(train_paths) == 0 or len(val_paths) == 0:
+            raise RuntimeError("Pose split produced empty train or val set; adjust training.val_fraction.")
+    else:
+        raise ValueError("data.layout must be one of: classic, poses")
 
     train_tf = build_transform(img_size=img_size, train=True, augment=augment_cfg)
     val_tf = build_transform(img_size=img_size, train=False, augment=AugmentConfig(enabled=False))
 
-    train_ds = GrayscaleImageDataset(train_paths, transform=train_tf, labels=None)
-    val_ds = GrayscaleImageDataset(val_paths, transform=val_tf, labels=None)
+    if data_layout == "classic":
+        train_ds = GrayscaleImageDataset(train_paths, transform=train_tf, labels=None)
+        val_ds = GrayscaleImageDataset(val_paths, transform=val_tf, labels=None)
+    else:
+        assert train_pose_ids is not None and val_pose_ids is not None
+        train_ds = GrayscalePoseDataset(train_paths, train_pose_ids, transform=train_tf, labels=None)
+        val_ds = GrayscalePoseDataset(val_paths, val_pose_ids, transform=val_tf, labels=None)
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -180,7 +224,8 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        for x, _path in tqdm(train_loader, desc=f"train {epoch}/{epochs}"):
+        for batch in tqdm(train_loader, desc=f"train {epoch}/{epochs}"):
+            x = batch[0]
             x = x.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -194,10 +239,16 @@ def main() -> None:
         model.eval()
         val_losses = []
         val_scores = []
-        val_paths_batch = []
+        val_paths_batch: list[str] = []
+        val_pose_ids_batch: list[str] = []
         saved_recon = False
         with torch.no_grad():
-            for x, paths in tqdm(val_loader, desc=f"val {epoch}/{epochs}"):
+            for batch in tqdm(val_loader, desc=f"val {epoch}/{epochs}"):
+                if data_layout == "classic":
+                    x, paths = batch
+                    pose_ids = None
+                else:
+                    x, paths, pose_ids = batch
                 x = x.to(device, non_blocking=True)
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     recon = model(x)
@@ -206,6 +257,8 @@ def main() -> None:
                 scores = anomaly_score_mse(x, recon).detach().cpu().numpy()
                 val_scores.append(scores)
                 val_paths_batch.extend(list(paths))
+                if pose_ids is not None:
+                    val_pose_ids_batch.extend(list(pose_ids))
 
                 if (not saved_recon) and save_recon_every > 0 and epoch % save_recon_every == 0:
                     save_recon_grid(run_dir / "recons" / f"epoch_{epoch:04d}.png", x, recon)
@@ -262,16 +315,27 @@ def main() -> None:
 
     all_scores = []
     all_paths = []
+    all_pose_ids: list[str] = []
     with torch.no_grad():
-        for x, paths in tqdm(val_loader, desc="val scores (best)"):
+        for batch in tqdm(val_loader, desc="val scores (best)"):
+            if data_layout == "classic":
+                x, paths = batch
+                pose_ids = None
+            else:
+                x, paths, pose_ids = batch
             x = x.to(device, non_blocking=True)
             recon = model(x)
             scores = anomaly_score_mse(x, recon).detach().cpu().numpy()
             all_scores.append(scores)
             all_paths.extend(list(paths))
+            if pose_ids is not None:
+                all_pose_ids.extend(list(pose_ids))
     scores_np = np.concatenate(all_scores, axis=0)
 
-    val_scores_df = pd.DataFrame({"path": all_paths, "score": scores_np})
+    if data_layout == "poses":
+        val_scores_df = pd.DataFrame({"pose_id": all_pose_ids, "path": all_paths, "score": scores_np})
+    else:
+        val_scores_df = pd.DataFrame({"path": all_paths, "score": scores_np})
     val_scores_df.to_csv(run_dir / "val_scores.csv", index=False)
 
     thr_cfg = cfg["threshold"]
@@ -292,6 +356,35 @@ def main() -> None:
         },
     )
     print(f"Threshold: {thr_res.threshold:.6g} ({thr_res.method})")
+
+    if data_layout == "poses":
+        # Per-pose threshold distributions (computed from pose-specific val scores)
+        thresholds_by_pose: dict[str, dict] = {}
+        for pose_id, group in val_scores_df.groupby("pose_id"):
+            s = group["score"].astype(float).to_numpy()
+            pose_thr = select_threshold(
+                scores=s,
+                method=str(thr_cfg["method"]),
+                percentile=float(thr_cfg["percentile"]),
+                mean_std_k=float(thr_cfg["mean_std_k"]),
+            )
+            thresholds_by_pose[str(pose_id)] = {
+                "threshold": pose_thr.threshold,
+                "method": pose_thr.method,
+                "params": pose_thr.params,
+                "val_score_stats": pose_thr.stats,
+                "n_val": int(len(s)),
+            }
+        save_json(
+            run_dir / "thresholds_by_pose.json",
+            {
+                "layout": "poses",
+                "pose_thresholds": thresholds_by_pose,
+                "global_threshold": thr_res.threshold,
+                "global_val_score_stats": thr_res.stats,
+                "best_epoch": best_epoch,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -8,7 +8,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from encdec.config_utils import deep_update, load_yaml
-from encdec.data import AugmentConfig, GrayscaleImageDataset, filter_corrupted, list_images, build_transform
+from encdec.data import (
+    AugmentConfig,
+    GrayscaleImageDataset,
+    GrayscalePoseDataset,
+    build_transform,
+    filter_corrupted,
+    list_images,
+    list_images_by_pose,
+)
 from encdec.model import ConvAutoencoder, ModelConfig
 from encdec.runtime import make_worker_init_fn, pick_device, seed_everything
 
@@ -40,19 +48,36 @@ def main() -> None:
     print(f"Device: {device}")
 
     data_root = Path(cfg["data"]["root"])
+    data_layout = str(cfg["data"].get("layout", "classic"))
     train_dir = cfg["data"]["train_dir"]
     extensions = cfg["data"]["extensions"]
     verify_images = bool(cfg["data"].get("verify_images", True))
 
-    paths = list_images(data_root / train_dir, extensions)
-    if verify_images:
-        paths = filter_corrupted(paths, corrupt_log_path=None)
-    if len(paths) == 0:
-        raise RuntimeError("No images found for smoke test.")
+    pose_ids = None
+    if data_layout == "classic":
+        paths = list_images(data_root / train_dir, extensions)
+        if verify_images:
+            paths = filter_corrupted(paths, corrupt_log_path=None)
+        if len(paths) == 0:
+            raise RuntimeError("No images found for smoke test.")
+    elif data_layout == "poses":
+        paths, pose_ids = list_images_by_pose(
+            poses_root=data_root,
+            extensions=extensions,
+            verify_images=verify_images,
+            corrupt_log_path=None,
+        )
+        if len(paths) == 0:
+            raise RuntimeError("No pose images found for smoke test.")
+    else:
+        raise ValueError("data.layout must be one of: classic, poses")
 
     img_size = int(cfg["preprocess"]["img_size"])
     tf = build_transform(img_size=img_size, train=False, augment=AugmentConfig(enabled=False))
-    ds = GrayscaleImageDataset(paths, transform=tf, labels=None)
+    if pose_ids is not None:
+        ds = GrayscalePoseDataset(paths, pose_ids, transform=tf, labels=None)
+    else:
+        ds = GrayscaleImageDataset(paths, transform=tf, labels=None)
 
     batch_size = int(cfg["training"]["batch_size"])
     num_workers = int(cfg["training"]["num_workers"])
@@ -78,7 +103,8 @@ def main() -> None:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(ckpt["model_state"])
 
-    x, _paths = next(iter(loader))
+    batch = next(iter(loader))
+    x = batch[0]
     x = x.to(device, non_blocking=True)
 
     if device.type == "cuda":
@@ -98,4 +124,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

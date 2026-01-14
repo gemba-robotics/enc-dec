@@ -47,14 +47,25 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else csv_path.parent / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    threshold = args.threshold
+    threshold: float | None = args.threshold
+    thresholds_by_pose: dict[str, float] | None = None
     if threshold is None:
         thr_file = Path(args.threshold_file) if args.threshold_file else _auto_threshold_file(csv_path)
         if thr_file is not None and thr_file.exists():
             with open(thr_file, "r", encoding="utf-8") as f:
-                threshold = float(json.load(f)["threshold"])
+                data = json.load(f)
+            if "pose_thresholds" in data:
+                thresholds_by_pose = {k: float(v["threshold"]) for k, v in data["pose_thresholds"].items()}
+                threshold = None
+            elif "threshold" in data:
+                threshold = float(data["threshold"])
 
-    if threshold is not None:
+    if thresholds_by_pose is not None:
+        if "pose_id" not in df.columns:
+            raise ValueError("Per-pose thresholds provided but CSV has no pose_id column.")
+        df["pose_threshold"] = df["pose_id"].map(thresholds_by_pose).astype(float)
+        df["predicted_bad"] = (df["score"] > df["pose_threshold"]).astype(int)
+    elif threshold is not None:
         df["predicted_bad"] = (df["score"] > float(threshold)).astype(int)
 
     df.to_csv(out_dir / "scored.csv", index=False)
@@ -64,6 +75,7 @@ def main() -> None:
     summary: dict[str, object] = {
         "n": int(len(df)),
         "threshold": float(threshold) if threshold is not None else None,
+        "per_pose_thresholds": bool(thresholds_by_pose is not None),
     }
 
     plt.figure(figsize=(8, 5))
@@ -122,6 +134,32 @@ def main() -> None:
             target = float(args.tpr_target)
             idx = int(np.argmin(np.abs(tpr - target)))
             summary["fpr_at_tpr"] = {"tpr": float(tpr[idx]), "fpr": float(fpr[idx])}
+
+    if "pose_id" in df.columns:
+        by_pose: dict[str, object] = {}
+        for pose_id, group in df.groupby("pose_id"):
+            pose_summary: dict[str, object] = {"n": int(len(group))}
+            pose_scores = group["score"].astype(float).to_numpy()
+            pose_summary["score_mean"] = float(pose_scores.mean()) if pose_scores.size else None
+            pose_summary["score_std"] = float(pose_scores.std(ddof=0)) if pose_scores.size else None
+            pose_summary["score_p99"] = float(np.percentile(pose_scores, 99)) if pose_scores.size else None
+
+            if has_labels and group["label"].nunique() == 2:
+                y_true_p = group["label"].astype(int).to_numpy()
+                y_score_p = group["score"].astype(float).to_numpy()
+                pose_summary["auroc"] = float(roc_auc_score(y_true_p, y_score_p))
+                pose_summary["auprc"] = float(average_precision_score(y_true_p, y_score_p))
+
+                if "predicted_bad" in group.columns:
+                    cm = confusion_matrix(
+                        y_true_p,
+                        group["predicted_bad"].astype(int).to_numpy(),
+                        labels=[0, 1],
+                    )
+                    pose_summary["confusion_matrix"] = cm.tolist()
+
+            by_pose[str(pose_id)] = pose_summary
+        summary["by_pose"] = by_pose
 
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

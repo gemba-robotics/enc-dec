@@ -11,6 +11,18 @@ Expected folders under a dataset root:
 
 Corrupted JPGs are skipped and logged during file listing/verification.
 
+## Pose-folder layout (your current setup)
+
+If your dataset is a single folder where **each subfolder is a pose ID** (e.g. `/sd/mehrdad/good_parts/grouped_by_suffix/<pose_id>/*.jpg`), set:
+
+- `data.layout: poses`
+- `data.root: /sd/mehrdad/good_parts/grouped_by_suffix`
+
+Training uses `training.val_fraction` to split **within each pose** (good-only) and produces:
+
+- Global threshold: `runs/<timestamp>/threshold.json`
+- Per-pose thresholds + distributions: `runs/<timestamp>/thresholds_by_pose.json`
+
 ## Native setup
 
 - Install Python deps (uv): `uv venv && source .venv/bin/activate && uv pip install -r requirements.txt`
@@ -20,6 +32,10 @@ Corrupted JPGs are skipped and logged during file listing/verification.
 ## Train
 
 `python3 train.py --config config.yaml --data_root /path/to/dataset`
+
+Pose-folder example:
+
+`python3 train.py --config config.yaml --data_root /sd/mehrdad/good_parts/grouped_by_suffix --layout poses --val_fraction 0.1`
 
 Artifacts are written to `runs/<timestamp>/`:
 
