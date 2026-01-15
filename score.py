@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -42,8 +43,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--device", type=str, default=None, choices=["auto", "cpu", "cuda"])
+    p.add_argument("--fixed_label", type=int, default=None, choices=[0, 1], help="Optional: assign this label to all images.")
     p.add_argument("--threshold", type=float, default=None, help="If set, adds predicted_bad column.")
     p.add_argument("--threshold_file", type=str, default=None, help="JSON file with a 'threshold' field.")
+
+    p.add_argument(
+        "--infer_pose_from_filename",
+        action="store_true",
+        help="Infer pose_id from filename using --pose_id_regex when inputs are not pose-folders.",
+    )
+    p.add_argument(
+        "--pose_id_regex",
+        type=str,
+        default=r"-([0-9a-fA-F]{4})\.(?:jpe?g)$",
+        help="Regex with one capture group for pose_id (matched against the filename).",
+    )
 
     p.add_argument("--save_qualitative", action="store_true")
     p.add_argument("--topk", type=int, default=20)
@@ -132,6 +146,17 @@ def main() -> None:
     if len(paths) == 0:
         raise RuntimeError("No images found to score.")
 
+    if args.fixed_label is not None and labels is None:
+        labels = [int(args.fixed_label)] * len(paths)
+
+    if pose_ids is None and args.infer_pose_from_filename:
+        pattern = re.compile(args.pose_id_regex)
+        inferred: list[str] = []
+        for p in paths:
+            m = pattern.search(p.name)
+            inferred.append(m.group(1) if m else "unknown")
+        pose_ids = inferred
+
     tf = build_transform(img_size=img_size, train=False, augment=AugmentConfig(enabled=False))
     if pose_ids is not None:
         ds = GrayscalePoseDataset(paths, pose_ids, transform=tf, labels=labels)
@@ -190,6 +215,7 @@ def main() -> None:
     df.to_csv(args.output_csv, index=False)
 
     threshold: float | None = None
+    global_threshold_from_pose_file: float | None = None
     thresholds_by_pose: dict[str, float] | None = None
     if args.threshold is not None:
         threshold = float(args.threshold)
@@ -198,6 +224,8 @@ def main() -> None:
             data = json.load(f)
             if "pose_thresholds" in data:
                 thresholds_by_pose = {k: float(v["threshold"]) for k, v in data["pose_thresholds"].items()}
+                if "global_threshold" in data:
+                    global_threshold_from_pose_file = float(data["global_threshold"])
             else:
                 threshold = float(data["threshold"])
     else:
@@ -208,6 +236,8 @@ def main() -> None:
             with open(cand_pose, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 thresholds_by_pose = {k: float(v["threshold"]) for k, v in data["pose_thresholds"].items()}
+                if "global_threshold" in data:
+                    global_threshold_from_pose_file = float(data["global_threshold"])
         elif cand_global.exists():
             with open(cand_global, "r", encoding="utf-8") as f:
                 threshold = float(json.load(f)["threshold"])
@@ -215,7 +245,10 @@ def main() -> None:
     if thresholds_by_pose is not None:
         if "pose_id" not in df.columns:
             raise ValueError("Per-pose thresholds provided but CSV has no pose_id column.")
-        df["pose_threshold"] = df["pose_id"].map(thresholds_by_pose).astype(float)
+        df["pose_threshold"] = df["pose_id"].map(thresholds_by_pose)
+        if global_threshold_from_pose_file is not None:
+            df["pose_threshold"] = df["pose_threshold"].fillna(global_threshold_from_pose_file)
+        df["pose_threshold"] = df["pose_threshold"].astype(float)
         df["predicted_bad"] = (df["score"] > df["pose_threshold"]).astype(int)
         df.to_csv(args.output_csv, index=False)
     elif threshold is not None:

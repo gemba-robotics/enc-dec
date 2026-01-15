@@ -59,6 +59,21 @@ Optionally save qualitative reconstructions + per-pixel error heatmaps:
 
 `python3 score.py --checkpoint runs/<timestamp>/checkpoints/best.pt --data_root /path/to/dataset --output_csv runs/<timestamp>/test_scores.csv --save_qualitative`
 
+### Quick “signs of life” test with a flat bad-images folder
+
+If you have a folder of known-bad images like `/mnt/sd/mehrdad/test/images` and filenames end with `-<pose_id>.jpg` (e.g. `...-0438.jpg`), score them with inferred `pose_id` and a fixed label:
+
+`python3 score.py --checkpoint runs/<timestamp>/checkpoints/best.pt --input_dir /mnt/sd/mehrdad/test/images --fixed_label 1 --infer_pose_from_filename --threshold_file runs/<timestamp>/thresholds_by_pose.json --output_csv runs/<timestamp>/bad_scores.csv`
+
+Score good images (pose-folder root) as label 0:
+
+`python3 score.py --checkpoint runs/<timestamp>/checkpoints/best.pt --data_root /sd/mehrdad/good_parts/grouped_by_suffix --fixed_label 0 --output_csv runs/<timestamp>/good_scores.csv`
+
+Combine and evaluate:
+
+`python3 -c "import pandas as pd; pd.concat([pd.read_csv('runs/<timestamp>/good_scores.csv'), pd.read_csv('runs/<timestamp>/bad_scores.csv')]).to_csv('runs/<timestamp>/combined.csv', index=False)"`
+`python3 eval.py --csv runs/<timestamp>/combined.csv --threshold_file runs/<timestamp>/thresholds_by_pose.json`
+
 ## Eval
 
 `python3 eval.py --csv runs/<timestamp>/test_scores.csv --threshold_file runs/<timestamp>/threshold.json`
