@@ -28,7 +28,11 @@ class AugmentConfig:
 
 
 def _is_image_path(path: Path, extensions: Sequence[str]) -> bool:
-    return path.is_file() and any(str(path).endswith(ext) for ext in extensions)
+    if not path.is_file():
+        return False
+    ext = path.suffix.lower()
+    allowed = {e.lower() for e in extensions}
+    return ext in allowed
 
 
 def list_images(folder: str | Path, extensions: Sequence[str], recursive: bool = False) -> list[Path]:

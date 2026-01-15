@@ -144,7 +144,12 @@ def main() -> None:
                 pose_ids = [pid for p, pid in zip(before, pose_ids) if str(p) in kept]
 
     if len(paths) == 0:
-        raise RuntimeError("No images found to score.")
+        if args.input_dir:
+            p = Path(args.input_dir)
+            raise RuntimeError(
+                f"No images found to score under --input_dir={p} (exists={p.exists()}, is_dir={p.is_dir()}, extensions={extensions})."
+            )
+        raise RuntimeError(f"No images found to score. (extensions={extensions})")
 
     if args.fixed_label is not None and labels is None:
         labels = [int(args.fixed_label)] * len(paths)
